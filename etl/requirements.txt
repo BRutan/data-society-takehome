@@ -1,0 +1,6 @@
+openpyxl
+polars
+pyspark
+psycopg2-binary
+requests
+sqlalchemy

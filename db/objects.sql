@@ -1,0 +1,5 @@
+CREATE DATABASE eia;
+
+CREATE SCHEMA facilities;
+
+CREATE TABLE generator

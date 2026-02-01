@@ -1,0 +1,35 @@
+services:
+  db:
+    container_name: data-society-db
+    build:
+      context: .
+      dockerfile: ./db/Dockerfile
+    ports:
+      - "5441:5432"
+    networks:
+      data-society:
+        aliases:
+          - data-society-db
+
+  etl:
+    container_name: data-society-etl
+    build:
+      context: .
+      dockerfile: ./etl/Dockerfile
+    volumes:
+      - ./etl/jobs/:/home/etl-user/jobs/
+      - ./etl/raw_data/:/home/etl-user/raw_data/
+      - ./etl/shared/:/home/etl-user/shared/
+    #depends_on:
+    #  - db
+    networks:
+      data-society:
+        aliases:
+          - data-society-etl
+    tty: true
+    stdin_open: true
+
+networks:
+  data-society:
+    driver: bridge
+    name: data-society
