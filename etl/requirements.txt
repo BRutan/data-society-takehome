@@ -1,6 +1,12 @@
+bs4
+fastexcel
+lxml
 openpyxl
+pandas
 polars
 pyspark
 psycopg2-binary
+pyarrow
+pyyaml
 requests
-sqlalchemy
+tqdm

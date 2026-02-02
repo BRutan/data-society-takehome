@@ -1,0 +1,52 @@
+{
+  "solar": {
+    "Operable": "solar.operable",
+    "Retired and Canceled": "solar.retired_and_canceled"
+  },
+  "enviroequip": {
+    "Emission Standards & Strategies": "enviroequip.emission_standards_strategies",
+    "Boiler Info & Design Parameters": "enviroequip.boiler_info_design_parameters",
+    "Cooling": "enviroequip.cooling",
+    "FGP": "enviroequip.fgp",
+    "FGD": "enviroequip.fgd",
+    "Stack Flue": "enviroequip.stack_flue"
+  },
+  "multifuel": {
+    "Operable": "multifuel.operable",
+    "Proposed": "multifuel.proposed",
+    "Retired and Canceled": "multifuel.retired_and_canceled"
+  },
+  "utility": {
+    "Utility": "utility.utility"
+  },
+  "wind": {
+    "Operable": "wind.operable",
+    "Retired and Canceled": "wind.retired_and_canceled"
+  },
+  "energystorage": {
+    "Operable": "energystorage.operable",
+    "Proposed": "energystorage.proposed",
+    "Retired and Canceled": "energystorage.retired_and_canceled"
+  },
+  "plant": {
+    "Plant": "plant.plant"
+  },
+  "enviroassoc": {
+    "Boiler Generator": "enviroassoc.boiler_generator",
+    "Boiler Cooling": "enviroassoc.boiler_cooling",
+    "Boiler Particulate Matter": "enviroassoc.boiler_particulate_matter",
+    "Boiler SO2": "enviroassoc.boiler_so2",
+    "Boiler NOx": "enviroassoc.boiler_nox",
+    "Boiler Mercury": "enviroassoc.boiler_mercury",
+    "Boiler Stack Flue": "enviroassoc.boiler_stack_flue",
+    "Emissions Control Equipment": "enviroassoc.emissions_control_equipment"
+  },
+  "generator": {
+    "Operable": "generator.operable",
+    "Proposed": "generator.proposed",
+    "Retired and Canceled": "generator.retired_and_canceled"
+  },
+  "owner": {
+    "Ownership": "owner.ownership"
+  }
+}
