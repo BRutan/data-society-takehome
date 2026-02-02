@@ -15,13 +15,15 @@ def get_logger(app_name:str) -> logging.Logger:
     with open(cfg_path, "r") as f:
         log_cfg = yaml.safe_load(f)
     logging.config.dictConfig(log_cfg)
+    # Silence the fastexcel warnings:
+    logging.getLogger("fastexcel").setLevel(logging.ERROR)
     return logging.getLogger(app_name)
 
 log = get_logger("etl")
 
 def log_execution(func):
     """
-    * Log start end end of logs.
+    * Log start and end of function using decorator.
     """
     @wraps(func)
     def wrapper(*args, **kwargs):
