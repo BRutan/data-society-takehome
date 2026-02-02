@@ -7,9 +7,8 @@ import os
 import pandas as pd
 import polars as pl
 from pyspark.sql import DataFrame, SparkSession
-import pyspark.sql.functions as F
 import psycopg2
-from shared.functions import log, log_execution, standardize_object_name
+from shared.functions import download_unzip_file, log, log_execution, should_skip, standardize_object_name
 import re
 import requests
 from tqdm import tqdm
@@ -32,8 +31,8 @@ TYPE_MAP = {
     "Float64": "NUMERIC(18, 6)",
     "Boolean": "BOOLEAN"
 }
-REV_TYPE_MAP = {v:k for k,v in TYPE_MAP.items()}
 
+REV_TYPE_MAP = {v:k for k,v in TYPE_MAP.items()}
 JDBC_URL = "jdbc:postgresql://{DB_HOST}:{DB_PORT}/{DB_DBNAME}".format(**os.environ)
 
 def main():
@@ -53,7 +52,9 @@ def get_args() -> Namespace:
     """
     * Get command line arguments 
     """
-    parser = ArgumentParser("pull_load_raw_data")
+    description = "Pull .zip files containing eia data for each year."
+    description += "\nLoad into raw tables following transformation."
+    parser = ArgumentParser("pull_load_raw_data", description=description)
     parser.add_argument("--start_year", type=int, required=True, help="Start year for pulling data.")
     parser.add_argument("--end_year", type = int, required=True, help="End year for pulling data.")
     parser.add_argument("--out_dir", default="/home/etl-user/raw_data", help="Output directory for data.")
@@ -97,7 +98,7 @@ def download_unzip_data(links:List[str], args:Namespace, log:logging.Logger) -> 
     output_dirs = []
     log.info("Downloading data from %s links.", len(links))
     for link in tqdm(links):
-        path = download_unzip_file(link, args, log)
+        path = download_unzip_file(link, args.out_dir, log)
         output_dirs.append(path)
     return output_dirs
 
@@ -126,6 +127,7 @@ def load_raw_data(output_dirs:List[str], args:Namespace, log:logging.Logger):
         for out_dir in tqdm(output_dirs):
             log.debug("Loading %s.", out_dir)
             load_check_excel_files(spark, cursor, table_schemas, out_dir, log)
+    log.info("Completed the raw data load for year range [%s, %s].", args.start_year, args.end_year)
 
 @log_execution
 def load_check_excel_files(spark:SparkSession, 
@@ -134,7 +136,8 @@ def load_check_excel_files(spark:SparkSession,
                            out_dir:str, 
                            log:logging.Logger):
     """
-    * Load excel files directly into target table
+    * Extract transform and load each Excel workbook's
+    sheets to the mapped table in the postgres backend.
     """
     file_year = int(re.search(r"\d{4}$", out_dir)[0])
     log.info("Extracting data for year %s.", file_year)
@@ -216,40 +219,6 @@ def standardize_align_columns(df:pl.DataFrame, col_order:List[str], schema:dict,
         df = df.with_columns(pl.lit(None).cast(tp).alias(m))
     # Align the columns in order:
     return df.select(*col_order)
-
-def should_skip(f:str) -> bool:
-    """
-    * Indicate if should skip the current file.
-    """
-    # Skip anything not an Excel workbook:
-    if not f.endswith(".xlsx"):
-        return True
-    elif any(pt in f for pt in ["EIA-860 Form", "LayoutY"]):
-        return True
-    # Skip open files:
-    elif f.startswith("~"):
-        return True
-    return False
-
-def download_unzip_file(link:str, args:Namespace, log:logging.Logger):
-    """
-    * Download the file using streaming.
-    """
-    with requests.get(link, stream=True) as r:
-        zip_path = re.search(r"(?P<f>\d+\.zip)$", link)["f"]
-        zip_path = os.path.join(args.out_dir, zip_path)
-        log.debug("Downloading file from %s to %s.", link, zip_path)
-        r.raise_for_status()
-        with open(zip_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
-        # Unzip the file:
-        zip_out_dir = zip_path.replace(".zip", "")
-        with zipfile.ZipFile(zip_path, "r") as z:
-            z.extractall(zip_out_dir)
-        os.remove(zip_path)
-        return zip_out_dir
 
 if __name__ == "__main__":
     main()

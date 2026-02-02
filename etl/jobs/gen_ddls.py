@@ -5,50 +5,56 @@ import logging
 import os
 import pandas as pd
 import polars as pl
-from shared.functions import log, log_execution, standardize_object_name
+from shared.functions import download_unzip_file, log, log_execution, should_skip, standardize_object_name
 import re
 import requests
 import textwrap
 from tqdm import tqdm
 from typing import List
 from urllib.parse import urljoin
-import zipfile
 
 TYPE_MAP = {
     "Int64": "BIGINT",
     "String": "VARCHAR",
-    "Float64": "DECIMAL(32, 32)",
+    "Float64": "NUMERIC(18, 6)",
     "Boolean": "BOOLEAN"
 }
 
-
 def main():
     """
-    * 
+    * 1. Extract all requested years' .zip files from the eia website.
+    2. Use polars to determine appropriate postgres ddl that can store the columns,
+    using the most conservative type allowable (preferring numeric unless mixed or contains ascii).
+    3. Generate json files containing the following:
+    - file_table_map.json: Maps the standardized { file_name -> sheet_name -> table_name }.
+    - table_schemas.json: The final postgres column metadata for each table.
+    - table_years.json: All years that the table has data for, based on file being present
+    in the .zip file.
+    - year_schemas.json: Each table column schema metadata by year. Used to determine the final ddl.
+    4. Generate table_ddls.sql containing the raw postgres table ddls based on the
+    column metadata.
     """
-    args = get_args(log)
+    args = get_args()
     links = get_source_links(args, log)
     paths = download_unzip_data(links, args, log)
-    schemas, table_map = get_schema_info(paths, log)
-    with open("config/schemas.json", "w") as f:
-        f.write(json.dumps(schemas, indent=2))
-    gen_ddls(schemas, table_map, args, log)
+    year_schemas, file_table_map = get_schema_info(paths, log)
+    file_data = gen_ddls(year_schemas, args, log)
+    file_data += [file_table_map]
+    write_files(*file_data, log=log)
 
 @log_execution
-def get_args(log:logging.Logger) -> Namespace:
+def get_args() -> Namespace:
     """
     * Get command line arguments 
     """
-    parser = ArgumentParser("pull_load_raw_data")
-    parser.add_argument("--out_dir", required=True, help="Output directory for data.")
-    parser.add_argument("--start_year", type=int, required=True, help="Start year for pulling data.")
-    parser.add_argument("--end_year", type = int, required=True, help="End year for pulling data.")
+    description = "Generate ddls for each eia year's pulled data source."
+    parser = ArgumentParser("gen_ddls", description=description)
+    parser.add_argument("--start_year", type=int, required=True, help="Start year for parsing data.")
+    parser.add_argument("--end_year", type=int, required=True, help="End year for parsing data.")
+    parser.add_argument("--out_dir", default="/home/etl-user/raw_data", help="Output directory for data.")
     
-    #args = parser.parse_args()
-
-    args = Namespace(start_year=2019,
-                     end_year=2024,
-                     out_dir="/home/etl-user/raw_data")
+    args = parser.parse_args()
+    
     # Check the arguments:
     errs = []
     if args.start_year >= args.end_year:
@@ -83,48 +89,48 @@ def download_unzip_data(links:List[str], args:Namespace, log:logging.Logger) -> 
     output_dirs = []
     log.info("Downloading data from %s links.", len(links))
     for link in tqdm(links):
-        path = download_unzip_file(link, args, log)
+        path = download_unzip_file(link, args.out_dir, log)
         output_dirs.append(path)
     return output_dirs
 
+@log_execution
 def get_schema_info(output_dirs:List[str], log:logging.Logger):
     """
     * Extract raw data from each .xlsx file and load
     into the raw destination table.
     """
     all_tps = set()
-    schemas = {}
+    year_schemas = {}
     table_map = {}
     for out_dir in output_dirs:
         log.debug("Loading %s.", out_dir)
         year = re.search(r"\d{4}$", out_dir)[0]
-        schemas[int(year)], tps = parse_excel_files(out_dir, table_map, log)
+        year_schemas[int(year)], tps = parse_excel_files(out_dir, table_map, log)
         all_tps.update(tps)
-    return schemas, table_map
+    return year_schemas, table_map
 
 @log_execution
 def parse_excel_files(out_dir:str, table_map:dict, log:logging.Logger):
     """
-    * Load excel files directly into target table
+    * Extract column metadata for each file's sheet and generate
+    appropriate ddls.
     """
     all_tps = set()
     schemas = {}
+    log.info("Parsing all files in directory %s.", out_dir)
     for f in os.listdir(out_dir):
-        if not f.endswith(".xlsx"):
-            continue
-        elif any(pt in f for pt in ["EIA-860 Form", "LayoutY"]):
-            continue
-        elif f.startswith("~"):
+        if should_skip(f):
+            log.debug("Skipping %s.", f)
             continue
         path = os.path.join(out_dir, f)
         parent = standardize_object_name(f)
-        log.debug("Writing file %s.", path)
-        # Get the sheets:
+        # Get the sheet names (need to use pandas because polars cannot read Excel metadata):
         xls = pd.ExcelFile(path)
         sheets = xls.sheet_names
         report = {}
         table_map[parent] = table_map.get(parent, {})
         for sheet in sheets:
+            log.debug("Sheet %s.", sheet)
             table_name = parent + "." + standardize_object_name(sheet)
             table_map[parent][sheet] = table_name
             df = pl.read_excel(path, read_options={"header_row": 1}, sheet_name=sheet)
@@ -132,14 +138,14 @@ def parse_excel_files(out_dir:str, table_map:dict, log:logging.Logger):
             # unique columns:
             exprs = []
             for c, dtype in df.schema.items():
+                log.debug("Column %s:%s.", c, dtype)
                 exprs.append(pl.col(c).n_unique().alias(f"{c}_distinct"))
-                exprs.append(pl.col(c).null_count().gt(0).alias(f"{c}_has_nulls"))
                 exprs.append(
                     (
                         pl.col(c).str.len_chars().max()
                         if dtype == pl.String
                         else pl.lit(None, dtype=pl.Int64)
-                    ).alias(f"{c}_max_len")
+                    ).alias(f"{c}_max_len") 
                 )
             sheet_report = df.select(exprs).to_dicts()[0]
             n_rows = df.count().shape[1]
@@ -147,55 +153,51 @@ def parse_excel_files(out_dir:str, table_map:dict, log:logging.Logger):
                 col.replace("_distinct", ""): {
                     "distinct_count": sheet_report[f"{col}_distinct"],
                     "is_distinct": sheet_report[f"{col}_distinct"] == n_rows,
-                    "has_nulls": sheet_report[f"{col}_has_nulls"],
                     "max_len": sheet_report[f"{col}_max_len"],
                     "col_type": str(tp)
                 }
                 for col, tp in df.schema.items()
             }
         all_tps.update(df.schema.values())
+        # Sort in 
         schemas[parent] = dict(sorted(report.items(), key=lambda x: x[0]))
     return dict(sorted(schemas.items(), key=lambda x: x[0])), table_map
 
-def gen_ddls(schema_info:dict, table_map:dict, args:Namespace, log:logging.Logger):
+@log_execution
+def gen_ddls(year_schemas:dict, args:Namespace, log:logging.Logger):
     """
     * Generate the most conservative ddls possible for each table
     across all years based on the column metadata.
     """
     # Group all data by table across years.
-    grouped_schemas = {}
+    log.info("Generating all ddls.")
     table_years = {}
+    grouped_schemas = {}
     years = list(range(args.start_year, args.end_year+1))
-    for year, table_schemas in schema_info.items():
-        for parent, sheet_schema in table_schemas.items():
+    for year, table_schemas in year_schemas.items():
+        for _, sheet_schema in table_schemas.items():
             for table_name, schema in sheet_schema.items():
                 grouped_schemas[table_name] = grouped_schemas.get(table_name, [])
                 grouped_schemas[table_name].append(schema)
                 table_years[table_name] = table_years.get(table_name, set())
                 table_years[table_name].add(year)
     table_years = {nm: list(yrs) for nm, yrs in table_years.items()}
-    with open("config/table_map.json", "w") as f:
-        f.write(json.dumps(table_map, indent=2))
-    with open("config/table_years.json", "w") as f:
-        f.write(json.dumps(table_years, indent=2))
     # Check if any tables missing for any years:
     if any(len(schemas) != len(years) for schemas in grouped_schemas.values()):
         missing = [tbl for tbl,schemas in grouped_schemas.items() if len(schemas) != len(years)]
         print(f"The following are not present for all years: {','.join(missing)}")
         missing_years = {nm: list(set(years) - set(table_years[nm])) for nm in missing}
         print(json.dumps(missing_years, indent=2))
-    # Use the earliest schemas as the quality check:
-    
-    # Generate ddls based on column attributes across schemas:
-    # Extract all schemas to generate:
+    # Generate ddls based on column attributes across years.
     schema_names = set([tbl.split(".")[0] for tbl in grouped_schemas])
     ddls = sorted([f"CREATE SCHEMA {sch};" for sch in schema_names])
     ddls.append("\n")
+    table_schemas = {}
     for tbl, schemas in grouped_schemas.items():
-        ddl = generate_table_ddl(tbl, schemas)
+        ddl, schema = generate_table_ddl(tbl, schemas)
+        table_schemas[tbl] = schema
         ddls.append(ddl + "\n")
-    with open("ddls.sql", "w") as f:
-        f.write("\n".join(ddls))
+    return [ddls, year_schemas, table_schemas, table_years]
 
 # Helpers:
 def generate_table_ddl(table_name:str, table_schemas:List[dict]) -> str:
@@ -203,39 +205,38 @@ def generate_table_ddl(table_name:str, table_schemas:List[dict]) -> str:
     * Generate a table ddl based upon all
     metadata.
     """
-    # Group by column attributes:
+    log.info("Generating ddl for table %s.", table_name)
     col_meta = {}
     for schema in table_schemas:
         for c, meta in schema.items():
-            col_name = standardize_object_name(c)
+            log.debug("Column %s", c)
+            # Note that we need to use the first 63 characters only
+            # because postgres truncates them:
+            col_name = standardize_object_name(c)[:63]
             col_meta[col_name] = col_meta.get(col_name, {})
             col_meta[col_name]["col_type"] = col_meta[col_name].get("col_type", set())
             col_meta[col_name]["is_distinct"] = col_meta[col_name].get("is_distinct", set())
-            col_meta[col_name]["not_null"] = col_meta[col_name].get("not_null", set())
             col_meta[col_name]["max_len"] = col_meta[col_name].get("max_len", set())
             col_meta[col_name]["col_type"].add(get_column_type(meta))
             col_meta[col_name]["is_distinct"].add(meta["is_distinct"])
-            col_meta[col_name]["not_null"].add(not meta["has_nulls"])
             col_meta[col_name]["max_len"].add(meta["max_len"])
     col_ddls = []
+    table_schema = {}
     for nm in col_meta:
         is_distinct = all(col_meta[nm]["is_distinct"])
-        not_null = all(col_meta[nm]["not_null"])
         # Get the column type:
         if len(col_meta[nm]["col_type"]) == 1:
             tp = list(col_meta[nm]["col_type"])[0]
         else:
             tp = "String"
         mapped_tp = TYPE_MAP[tp]
-        #max_len = max(col_meta[col_name]["max_len"]) if col_meta[col_name]["max_len"] else None
+        table_schema[nm] = mapped_tp
         max_len = None
         if max_len:
             mapped_tp += f"({max_len})"
         col_ddl = f"{nm} {mapped_tp}"
         if is_distinct and tp == "Int64":
             col_ddl += " PRIMARY KEY"
-        elif not_null:
-            col_ddl += " NOT NULL"
         col_ddls.append(col_ddl)
     # Include file date, file year and upload timestamp columns:
     col_ddls.append("file_year INT NOT NULL")
@@ -245,7 +246,7 @@ def generate_table_ddl(table_name:str, table_schemas:List[dict]) -> str:
     table_ddl.append(textwrap.indent(",\n".join(col_ddls), "\t"))
     table_ddl.append(");")
     table_ddl = "\n".join(table_ddl)
-    return table_ddl
+    return table_ddl, table_schema
 
 def get_column_type(meta:dict) -> str:
     """
@@ -255,34 +256,26 @@ def get_column_type(meta:dict) -> str:
         return "Boolean"
     return meta["col_type"]
 
-def max_string_len(df: pl.DataFrame, col: str):
-    if df.schema[col] == pl.Utf8:
-        return df.select(pl.col(col).str.len_chars().max()).item()
-    return None
-    
-def get_meta(meta):
-    if not meta["has_nulls"]:
-        return "NOT NULL"
-
-def download_unzip_file(link:str, args:Namespace, log:logging.Logger):
+def write_files(ddls:List[str], 
+                year_schemas:dict, 
+                table_schemas:dict, 
+                table_years:dict, 
+                file_table_map:dict,
+                log:logging.Logger):
     """
-    * Download the file using streaming.
+    * Output the final json metadata files.
     """
-    with requests.get(link, stream=True) as r:
-        zip_path = re.search(r"(?P<f>\d+\.zip)$", link)["f"]
-        zip_path = os.path.join(args.out_dir, zip_path)
-        log.debug("Downloading file from %s to %s.", link, zip_path)
-        r.raise_for_status()
-        with open(zip_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
-        # Unzip the file:
-        zip_out_dir = zip_path.replace(".zip", "")
-        with zipfile.ZipFile(zip_path, "r") as z:
-            z.extractall(zip_out_dir)
-        os.remove(zip_path)
-        return zip_out_dir
+    log.info("Writing all generated files to ./config.")
+    with open("config/table_ddls.sql", "w") as f:
+        f.write("\n".join(ddls))
+    with open("config/year_schemas.json", "w") as f:
+        f.write(json.dumps(year_schemas, indent=2))
+    with open("config/table_schemas.json", "w") as f:
+        f.write(json.dumps(table_schemas, indent=2))
+    with open("config/file_table_map.json", "w") as f:
+        f.write(json.dumps(file_table_map, indent=2))
+    with open("config/table_years.json", "w") as f:
+        f.write(json.dumps(table_years, indent=2))
 
 if __name__ == "__main__":
     main()

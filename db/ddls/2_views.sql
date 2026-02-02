@@ -309,10 +309,268 @@ SELECT
   age_years,
   nameplate_capacity_mw
 FROM generator_age
-WHERE age_years >= 35
+WHERE age_years >= 40
 ORDER BY age_years DESC, nameplate_capacity_mw DESC;
--- i) How is renewable energy and battery storage changing
+-- i) How is renewable energy (solar/wind) and battery storage penetration changing,
+-- and where are the geographic locations where the amount of positive change
+-- (increase) is greatest?
+CREATE OR REPLACE VIEW analysis.capacity_by_tech_geo_year AS
+WITH
+-- total operable capacity (denominator)
+total AS (
+  SELECT
+    file_year,
+    state,
+    county,
+    SUM(nameplate_capacity_mw) AS total_mw
+  FROM generator.operable
+  GROUP BY file_year, state, county
+),
 
+solar AS (
+  SELECT
+    file_year,
+    state,
+    county,
+    SUM(nameplate_capacity_mw) AS solar_mw
+  FROM solar.operable
+  GROUP BY file_year, state, county
+),
+
+wind AS (
+  SELECT
+    file_year,
+    state,
+    county,
+    SUM(nameplate_capacity_mw) AS wind_mw
+  FROM wind.operable
+  GROUP BY file_year, state, county
+),
+
+storage AS (
+  SELECT
+    file_year,
+    state,
+    county,
+    SUM(nameplate_capacity_mw) AS storage_mw
+  FROM energystorage.operable
+  GROUP BY file_year, state, county
+)
+
+SELECT
+  t.file_year,
+  t.state,
+  t.county,
+  t.total_mw,
+  COALESCE(s.solar_mw, 0)   AS solar_mw,
+  COALESCE(w.wind_mw, 0)    AS wind_mw,
+  COALESCE(es.storage_mw, 0) AS storage_mw
+FROM total t
+LEFT JOIN solar s
+  ON s.file_year=t.file_year AND s.state=t.state AND s.county=t.county
+LEFT JOIN wind w
+  ON w.file_year=t.file_year AND w.state=t.state AND w.county=t.county
+LEFT JOIN storage es
+  ON es.file_year=t.file_year AND es.state=t.state AND es.county=t.county;
+  
 -- j) Relationship between planned/proposed capacity additions 
 -- & recent retirements?
+CREATE VIEW analysis.additions_vs_retirements_geo AS
+WITH params AS (
+  SELECT
+    (SELECT MAX(file_year) FROM generator.operable) AS max_year,
+    3::int AS recent_years
+),
+-- -----------------------------
+-- Recent retirements (MW)
+-- -----------------------------
+ret_gen AS (
+  SELECT
+    g.state,
+    g.county,
+    g.retirement_year::int AS year,
+    SUM(g.nameplate_capacity_mw) AS retired_gen_mw,
+    -- Optional useful splits (only if energy_source_1 is populated)
+    SUM(CASE WHEN upper(COALESCE(g.energy_source_1,'')) IN ('SUN','WND','WAT','GEO','BIO','WAS','MSW') THEN g.nameplate_capacity_mw ELSE 0 END) AS retired_renew_mw,
+    SUM(CASE WHEN upper(COALESCE(g.energy_source_1,'')) IN ('COL','BIT','SUB','LIG','NG','DFO','RFO','OIL','PC','NGO','BFG','OG','KER','JF','PG','SGC') THEN g.nameplate_capacity_mw ELSE 0 END) AS retired_fossil_mw
+  FROM generator.retired_and_canceled g
+  JOIN params p ON TRUE
+  WHERE g.retirement_year IS NOT NULL
+    AND g.retirement_year ~ '^\d{4}$'
+    AND g.retirement_year::int >= (p.max_year - p.recent_years)
+    AND g.retirement_year::int <= p.max_year
+  GROUP BY g.state, g.county, g.retirement_year::int
+),
+ret_solar AS (
+  SELECT
+    s.state,
+    s.county,
+    s.retirement_year::int AS year,
+    SUM(s.nameplate_capacity_mw) AS retired_solar_mw
+  FROM solar.retired_and_canceled s
+  JOIN params p ON TRUE
+  WHERE s.retirement_year IS NOT NULL
+    AND s.retirement_year ~ '^\d{4}$'
+    AND s.retirement_year::int >= (p.max_year - p.recent_years)
+    AND s.retirement_year::int <= p.max_year
+  GROUP BY s.state, s.county, s.retirement_year::int
+),
+ret_wind AS (
+  SELECT
+    w.state,
+    w.county,
+    w.retirement_year::int AS year,
+    SUM(w.nameplate_capacity_mw) AS retired_wind_mw
+  FROM wind.retired_and_canceled w
+  JOIN params p ON TRUE
+  WHERE w.retirement_year IS NOT NULL
+    AND w.retirement_year ~ '^\d{4}$'
+    AND w.retirement_year::int >= (p.max_year - p.recent_years)
+    AND w.retirement_year::int <= p.max_year
+  GROUP BY w.state, w.county, w.retirement_year::int
+),
+ret_storage AS (
+  SELECT
+    e.state,
+    e.county,
+    e.retirement_year::int AS year,
+    SUM(e.nameplate_capacity_mw) AS retired_storage_mw
+  FROM energystorage.retired_and_canceled e
+  JOIN params p ON TRUE
+  WHERE e.retirement_year IS NOT NULL
+    AND e.retirement_year ~ '^\d{4}$'
+    AND e.retirement_year::int >= (p.max_year - p.recent_years)
+    AND e.retirement_year::int <= p.max_year
+  GROUP BY e.state, e.county, e.retirement_year::int
+),
+ret_all AS (
+  SELECT
+    state,
+    county,
+    year,
+    COALESCE(SUM(retired_gen_mw),0)     AS retired_gen_mw,
+    COALESCE(SUM(retired_renew_mw),0)   AS retired_renew_mw,
+    COALESCE(SUM(retired_fossil_mw),0)  AS retired_fossil_mw,
+    0::numeric AS retired_solar_mw,
+    0::numeric AS retired_wind_mw,
+    0::numeric AS retired_storage_mw
+  FROM ret_gen
+  GROUP BY state, county, year
 
+  UNION ALL
+  SELECT state, county, year,
+    0, 0, 0,
+    COALESCE(SUM(retired_solar_mw),0), 0, 0
+  FROM ret_solar
+  GROUP BY state, county, year
+
+  UNION ALL
+  SELECT state, county, year,
+    0, 0, 0,
+    0, COALESCE(SUM(retired_wind_mw),0), 0
+  FROM ret_wind
+  GROUP BY state, county, year
+
+  UNION ALL
+  SELECT state, county, year,
+    0, 0, 0,
+    0, 0, COALESCE(SUM(retired_storage_mw),0)
+  FROM ret_storage
+  GROUP BY state, county, year
+),
+ret_rollup AS (
+  SELECT
+    state,
+    county,
+    SUM(retired_gen_mw)     AS retired_gen_mw_recent,
+    SUM(retired_renew_mw)   AS retired_renew_mw_recent,
+    SUM(retired_fossil_mw)  AS retired_fossil_mw_recent,
+    SUM(retired_solar_mw)   AS retired_solar_mw_recent,
+    SUM(retired_wind_mw)    AS retired_wind_mw_recent,
+    SUM(retired_storage_mw) AS retired_storage_mw_recent
+  FROM ret_all
+  GROUP BY state, county
+),
+
+-- -----------------------------
+-- Proposed additions (MW)
+-- -----------------------------
+prop_gen AS (
+  SELECT
+    g.state,
+    g.county,
+    g.current_year::int AS year,
+    SUM(g.nameplate_capacity_mw) AS proposed_gen_mw
+  FROM generator.proposed g
+  JOIN params p ON TRUE
+  WHERE g.current_year IS NOT NULL
+    AND g.current_year >= (p.max_year - p.recent_years)
+    AND g.current_year <= p.max_year
+  GROUP BY g.state, g.county, g.current_year::int
+),
+prop_storage AS (
+  SELECT
+    e.state,
+    e.county,
+    e.current_year::int AS year,
+    SUM(e.nameplate_capacity_mw) AS proposed_storage_mw
+  FROM energystorage.proposed e
+  JOIN params p ON TRUE
+  WHERE e.current_year IS NOT NULL
+    AND e.current_year >= (p.max_year - p.recent_years)
+    AND e.current_year <= p.max_year
+  GROUP BY e.state, e.county, e.current_year::int
+),
+-- Note: you don't have solar.proposed / wind.proposed tables in your DDL.
+-- If solar/wind proposals are stored in generator.proposed via energy_source_1,
+-- you can derive them there; otherwise omit.
+prop_rollup AS (
+  SELECT
+    state,
+    county,
+    SUM(proposed_gen_mw) AS proposed_gen_mw_recent
+  FROM prop_gen
+  GROUP BY state, county
+),
+prop_storage_rollup AS (
+  SELECT
+    state,
+    county,
+    SUM(proposed_storage_mw) AS proposed_storage_mw_recent
+  FROM prop_storage
+  GROUP BY state, county
+)
+
+SELECT
+  COALESCE(r.state, p.state, ps.state)   AS state,
+  COALESCE(r.county, p.county, ps.county) AS county,
+
+  -- Recent retirements
+  COALESCE(r.retired_gen_mw_recent, 0)     AS retired_gen_mw_recent,
+  COALESCE(r.retired_fossil_mw_recent, 0)  AS retired_fossil_mw_recent,
+  COALESCE(r.retired_renew_mw_recent, 0)   AS retired_renew_mw_recent,
+  COALESCE(r.retired_solar_mw_recent, 0)   AS retired_solar_mw_recent,
+  COALESCE(r.retired_wind_mw_recent, 0)    AS retired_wind_mw_recent,
+  COALESCE(r.retired_storage_mw_recent, 0) AS retired_storage_mw_recent,
+
+  -- Proposed additions
+  COALESCE(p.proposed_gen_mw_recent, 0)    AS proposed_gen_mw_recent,
+  COALESCE(ps.proposed_storage_mw_recent, 0) AS proposed_storage_mw_recent,
+
+  -- Combined proposed (generator proposals + storage proposals)
+  (COALESCE(p.proposed_gen_mw_recent, 0) + COALESCE(ps.proposed_storage_mw_recent, 0)) AS proposed_total_mw_recent,
+
+  -- Net change vs retirements (using generator retirements as the retirement baseline)
+  (COALESCE(p.proposed_gen_mw_recent, 0) + COALESCE(ps.proposed_storage_mw_recent, 0))
+  - COALESCE(r.retired_gen_mw_recent, 0) AS net_mw_change_recent,
+
+  -- Replacement ratio
+  (COALESCE(p.proposed_gen_mw_recent, 0) + COALESCE(ps.proposed_storage_mw_recent, 0))
+  / NULLIF(COALESCE(r.retired_gen_mw_recent, 0), 0) AS replacement_ratio_recent
+
+FROM ret_rollup r
+FULL OUTER JOIN prop_rollup p
+  ON r.state = p.state AND r.county = p.county
+FULL OUTER JOIN prop_storage_rollup ps
+  ON COALESCE(r.state, p.state) = ps.state
+ AND COALESCE(r.county, p.county) = ps.county;

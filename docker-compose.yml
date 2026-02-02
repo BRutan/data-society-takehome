@@ -1,6 +1,7 @@
 services:
   db:
     container_name: data-society-db
+    user: postgres
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: Z7m@Q9fK!2xR#P5dWv8N
