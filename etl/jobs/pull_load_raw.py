@@ -25,41 +25,41 @@ DB_DSN = (
     "password={DB_PASSWORD}"
 ).format(**os.environ)
 
+# Map polars dtype to postgres type:
 TYPE_MAP = {
     "Int64": "BIGINT",
     "String": "VARCHAR",
     "Float64": "NUMERIC(18, 6)",
     "Boolean": "BOOLEAN"
 }
-
 REV_TYPE_MAP = {v:k for k,v in TYPE_MAP.items()}
 
 JDBC_URL = "jdbc:postgresql://{DB_HOST}:{DB_PORT}/{DB_DBNAME}".format(**os.environ)
 
 def main():
     """
-    * Pull raw data and load 
+    * 1. Get command line parameters containing the year period and output directory.
+    2. Extract all .zip files from the eia website.
+    3. Load each file into the target raw table, applying basic 
+    transformations.
     """
-    args = get_args(log)
+    args = get_args()
     links = get_source_links(args, log)
     paths = download_unzip_data(links, args, log)
     load_raw_data(paths, args, log)
 
 @log_execution
-def get_args(log:logging.Logger) -> Namespace:
+def get_args() -> Namespace:
     """
     * Get command line arguments 
     """
     parser = ArgumentParser("pull_load_raw_data")
-    parser.add_argument("--out_dir", required=True, help="Output directory for data.")
     parser.add_argument("--start_year", type=int, required=True, help="Start year for pulling data.")
     parser.add_argument("--end_year", type = int, required=True, help="End year for pulling data.")
+    parser.add_argument("--out_dir", default="/home/etl-user/raw_data", help="Output directory for data.")
     
-    #args = parser.parse_args()
+    args = parser.parse_args()
 
-    args = Namespace(start_year=2019,
-                     end_year=2024,
-                     out_dir="/home/etl-user/raw_data")
     # Check the arguments:
     errs = []
     if args.start_year >= args.end_year:
@@ -72,13 +72,16 @@ def get_args(log:logging.Logger) -> Namespace:
 @log_execution
 def get_source_links(args:Namespace, log:logging.Logger) -> List[str]:
     """
-    * Retrieve all source links containing zip files.
+    * Retrieve all links containing zip files 
+    for the target year range.
     """
     url = "https://www.eia.gov/electricity/data/eia860/"
+    log.info("Getting all source data from %s.", url)
     # Find all .zip file urls:
     result = requests.get(url)
     # Build the search pattern for xls files:
     year_range = [str(y) for y in range(args.start_year, args.end_year + 1)]
+    log.info("Using year range [%s, %s].", args.start_year, args.end_year)
     # Extract all of the urls containing .zip files for the years we want:
     soup = Soup(result.text, "lxml")
     zip_links = soup.select('a[href$=".zip"]')
@@ -109,46 +112,49 @@ def load_raw_data(output_dirs:List[str], args:Namespace, log:logging.Logger):
     spark = (SparkSession.builder
                          .config("spark.jars.packages", "org.postgresql:postgresql:42.7.8")
                          .getOrCreate())
-    # Create the output 
+    # Silence spark warnings:
+    spark.sparkContext.setLogLevel("ERROR")
+    # Create the output directory if not present:
     if not os.path.exists(args.out_dir):
         os.makedirs(args.out_dir)
-    with open("config/table_map.json", "r") as f:
-        table_map = json.load(f)
-    log.info("Loading raw data into the backend.")
+    # Load mapping {table_name -> column_name -> postgres_type}
+    # to transform data in standard format:
     with open("config/table_schemas.json", "r") as f:
         table_schemas = json.loads(f.read())
     with psycopg2.connect(dsn=DB_DSN).cursor() as cursor:
-        for out_dir in output_dirs:
+        log.info("Extracting all raw data from files into the backend.")
+        for out_dir in tqdm(output_dirs):
             log.debug("Loading %s.", out_dir)
-            load_check_excel_files(spark, cursor, table_map, table_schemas, out_dir, log)
+            load_check_excel_files(spark, cursor, table_schemas, out_dir, log)
 
 @log_execution
-def load_check_excel_files(spark, cursor, table_map:dict, table_schemas:dict, out_dir:str, log:logging.Logger):
+def load_check_excel_files(spark:SparkSession, 
+                           cursor:psycopg2.extensions.cursor, 
+                           table_schemas:dict, 
+                           out_dir:str, 
+                           log:logging.Logger):
     """
     * Load excel files directly into target table
     """
     file_year = int(re.search(r"\d{4}$", out_dir)[0])
+    log.info("Extracting data for year %s.", file_year)
     for f in os.listdir(out_dir):
-        if not f.endswith(".xlsx"):
-            continue
-        elif any(pt in f for pt in ["EIA-860 Form", "LayoutY"]):
-            continue
-        elif f.startswith("~"):
+        if should_skip(f):
+            log.debug("Skipping %s.", f)
             continue
         parent = standardize_object_name(f)
         path = os.path.join(out_dir, f)
         file_ts = datetime.fromtimestamp(os.path.getctime(path))
         log.debug("Writing file %s.", path)
         xls = pd.ExcelFile(path)
-        # Perform quality check:
         parent = standardize_object_name(f)
-        #quality_check(xls, f, parent, table_map, log)
         for sheet in xls.sheet_names:
+            log.debug("Writing sheet %s.", sheet)
             df = pl.read_excel(path, read_options={"header_row": 1}, sheet_name=sheet)
             table_name = parent + "." + standardize_object_name(sheet)
             schema = table_schemas[table_name]
-            # Add standard columns and transform existing ones to fit into
-            # target types:
+            # Add standard columns like file_date and transform
+            # columns to be in expected format:
             cursor.execute(f"select * from {table_name} limit 1")
             col_order = [c.name for c in cursor.description]
             df = standardize_align_columns(df, col_order, schema, file_year, file_ts)
@@ -156,34 +162,31 @@ def load_check_excel_files(spark, cursor, table_map:dict, table_schemas:dict, ou
             upsert_to_db(spark_df, cursor, table_name, file_year, log)
 
 @log_execution
-def quality_check(xls:pd.ExcelFile, f:str, parent:str, table_map:dict, log:logging.Logger):
-    """
-    * Perform quality checks regarding expected schemas and others.
-    """
-    # Ensure that all sheets are present:
-    missing = set(table_map[parent]) - set(xls.sheet_names)
-    if missing:
-        raise RuntimeError(f"The following sheets are missing from {f}: {','.join(missing)}")
-    # Ensure that all columns are present:
-
-
-@log_execution
 def upsert_to_db(df:DataFrame, cursor, target_table:str, file_year:int, log:logging.Logger):
-    #log.debug("Writing to %s.", DB_URL)
+    """
+    * Upsert the data to the raw table 
+    """
     # Upsert based on file year:
+    log.debug("Replacing all %s records for file_year %s.", target_table, file_year)
     cursor.execute(f"delete from {target_table} where file_year = {file_year}")
     props = {
         "user": os.environ["DB_USER"],
         "password": os.environ["DB_PASSWORD"],
         "driver": "org.postgresql.Driver",
     }
+    # Write records to target table:
     (df.write
        .mode("append")
        .jdbc(JDBC_URL, target_table, properties=props))
 
+# Helpers:
 def standardize_align_columns(df:pl.DataFrame, col_order:List[str], schema:dict, file_year: int, file_ts:datetime):
     """
-    * Add standard columns. 
+    * Standardize column names.
+    Add standard columns. 
+    Transform Y/N columns to be boolean and empty columns to be NULL.
+    Handle missing columns by setting to NULL.
+    Output the columns in the correct order for pyspark.
     """
     # Transform the column names using the standard object naming method:
     df = df.rename({c: standardize_object_name(c)[:63] for c in df.columns})
@@ -214,7 +217,20 @@ def standardize_align_columns(df:pl.DataFrame, col_order:List[str], schema:dict,
     # Align the columns in order:
     return df.select(*col_order)
 
-# Helpers:
+def should_skip(f:str) -> bool:
+    """
+    * Indicate if should skip the current file.
+    """
+    # Skip anything not an Excel workbook:
+    if not f.endswith(".xlsx"):
+        return True
+    elif any(pt in f for pt in ["EIA-860 Form", "LayoutY"]):
+        return True
+    # Skip open files:
+    elif f.startswith("~"):
+        return True
+    return False
+
 def download_unzip_file(link:str, args:Namespace, log:logging.Logger):
     """
     * Download the file using streaming.

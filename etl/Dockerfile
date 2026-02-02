@@ -41,3 +41,5 @@ ENV DB_PORT=${DB_PORT}
 COPY ./etl/config/ ./config/
 COPY ./etl/jobs/ ./jobs/
 COPY ./etl/shared/ ./shared/
+
+RUN echo 'export PYTHONPATH=${HOME}' >> ~/.zshrc
