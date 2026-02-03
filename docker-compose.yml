@@ -4,8 +4,8 @@ services:
     user: postgres
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: Z7m@Q9fK!2xR#P5dWv8N
       POSTGRES_DB: eia_data
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     build:
       context: .
       dockerfile: ./db/Dockerfile
@@ -26,17 +26,22 @@ services:
       args:
         DB_HOST: data-society-db
         DB_USER: postgres
-        DB_PASSWORD: Z7m@Q9fK!2xR#P5dWv8N
         DB_DBNAME: eia_data
         DB_PORT: 5432
+    environment:
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_HOST: data-society-db
+      DB_USER: postgres
+      DB_DBNAME: eia_data
+      DB_PORT: 5432
     volumes:
       - ./etl/config/:/home/etl-user/config/
       - ./etl/logs/:/home/etl-user/logs/
       - ./etl/jobs/:/home/etl-user/jobs/
       - ./etl/raw_data/:/home/etl-user/raw_data/
       - ./etl/shared/:/home/etl-user/shared/
-    #depends_on:
-    #  - db
+    depends_on:
+      - db
     networks:
       data-society:
         aliases:

@@ -1,2 +1,3 @@
 etl/raw_data/*
 *.log*
+.env

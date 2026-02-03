@@ -4,6 +4,10 @@
 - docker
 
 ## 1) Setup:
+- Create an .env file in same folder as docker-compose.yml with the following:
+```console
+POSTGRES_PASSWORD=<choose a password>
+```
 - Run the following commands to build and run the db and etl containers.
 ```console
 docker compose -f docker-compose.yml build
