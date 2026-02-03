@@ -133,5 +133,3 @@ Given more time, I would perform the following:
 1. Investigate the relationships between the data thoroughly and institute a star schema. 
 2. Map standard codes to a separate table for visibility purposes, and check consistency across years.
 3. Implement indexes on columns used in join predicates, partition by and group by clauses within the views to improve performance.
-
-In any workplace setting I would not expose raw credentials in the docker-compose.yml.
